@@ -9,6 +9,7 @@ const {
   handleOrderPay,
   handleGetOrder,
   handleOrderHistory,
+  handleDeleteOrder,
   handleCustomersWithBalance,
   handleWhatsAppSent,
   handleOrdersWithBalanceByCustomer,
@@ -28,6 +29,8 @@ router.get(
   requireAdmin,
   handleCustomersWithBalance,
 );
+
+router.delete("/order/:id", handleDeleteOrder);
 
 router.get(
   "/with-balance/:customerId",
