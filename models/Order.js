@@ -32,11 +32,16 @@ const orderSchema = mongoose.Schema(
     paidAmount: { type: Number, default: 0 },
     balanceAmount: { type: Number, default: 0 },
 
+    advanceAmount: { type: Number, default: 0 },
+
     status: {
       type: String,
       enum: ["pending", "partial", "paid"],
       default: "pending",
     },
+
+    walletUsed: { type: Number, default: 0 },
+    walletAdded: { type: Number, default: 0 }, // when extra money goes to wallet
 
     lastMessageSent: Date,
   },
