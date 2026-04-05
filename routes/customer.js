@@ -8,6 +8,7 @@ const {
   handleGetCustomerByName,
   handleCustomerDelete,
   handleCustomerUpdate,
+  handleUpdateWallet,
   handleBulkUploadFromExcel,
 } = require("../controllers/customer");
 const verifyToken = require("../middlewares/verifyToken");
@@ -24,5 +25,7 @@ router.delete("/:id", verifyToken, requireAdmin, handleCustomerDelete);
 router.patch("/:id", verifyToken, requireAdmin, handleCustomerUpdate);
 
 router.post("/upload-excel", upload.single("file"), handleBulkUploadFromExcel);
+
+router.patch("/customer/:id/wallet", handleUpdateWallet);
 
 module.exports = router;
