@@ -5,6 +5,9 @@ const Revenue = require("../models/Revenue");
 const Payment = require("../models/Payment");
 const mongoose = require("mongoose");
 
+/* =========================
+   CREATE ORDER (WALLET SUPPORT)
+========================= */
 async function handleCreateOrder(req, res) {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -12,6 +15,7 @@ async function handleCreateOrder(req, res) {
   try {
     const {
       customerId,
+      walletUsed = 0,
       items,
       subTotal,
       gstPercent = 18,
@@ -22,16 +26,22 @@ async function handleCreateOrder(req, res) {
       paidAmount = 0,
     } = req.body;
 
+    /* =========================
+       CUSTOMER
+    ========================= */
+    const customer = await Customer.findById(customerId).session(session);
+    if (!customer) throw new Error("Customer not found");
+
+    /* =========================
+       ITEMS + STOCK
+    ========================= */
     const finalItems = [];
 
     for (const i of items) {
       const product = await Product.findById(i.product).session(session);
 
-      if (!product) {
-        throw new Error("Product not found");
-      }
+      if (!product) throw new Error("Product not found");
 
-      // Stock validation only
       if (product.trackStock) {
         if (product.stock < i.qty) {
           throw new Error(`Insufficient stock for ${product.name}`);
@@ -41,7 +51,6 @@ async function handleCreateOrder(req, res) {
         await product.save({ session });
       }
 
-      // TRUST FRONTEND VALUES (unchanged)
       finalItems.push({
         product: product._id,
         name: i.name || product.name,
@@ -51,17 +60,52 @@ async function handleCreateOrder(req, res) {
       });
     }
 
-    const balanceAmount = Number(totalAmount) - Number(paidAmount);
+    /* =========================
+       WALLET + ADVANCE LOGIC
+    ========================= */
+
+    let safeWalletUsed = Math.max(0, walletUsed);
+    safeWalletUsed = Math.min(safeWalletUsed, customer.walletBalance);
+
+    // deduct wallet
+    customer.walletBalance -= safeWalletUsed;
+
+    // total paid (cash + wallet)
+    let totalPaid = Number(paidAmount) + safeWalletUsed;
+
+    let advanceAmount = 0;
+
+    // ✅ ADVANCE LOGIC (FIXED)
+    if (totalPaid > totalAmount) {
+      advanceAmount = totalPaid - totalAmount;
+
+      // add to wallet
+      customer.walletBalance += advanceAmount;
+
+      totalPaid = totalAmount;
+    }
+
+    await customer.save({ session });
+
+    /* =========================
+       ORDER CALCULATION
+    ========================= */
+
+    const balanceAmount = Number(totalAmount) - totalPaid;
 
     let status = "pending";
     if (balanceAmount <= 0) status = "paid";
-    else if (paidAmount > 0) status = "partial";
+    else if (totalPaid > 0) status = "partial";
+
+    /* =========================
+       CREATE ORDER
+    ========================= */
 
     const order = await Order.create(
       [
         {
           customer: customerId,
-          customerName: req.customerName,
+          customerName: customer.custName,
           items: finalItems,
 
           subTotal: Number(subTotal),
@@ -72,22 +116,44 @@ async function handleCreateOrder(req, res) {
           discount: Number(discount),
 
           totalAmount: Number(totalAmount),
-          paidAmount: Number(paidAmount),
+
+          paidAmount: totalPaid,
           balanceAmount,
           status,
+
+          walletUsed: safeWalletUsed,
+
+          // ✅ IMPORTANT
+          walletAdded: advanceAmount,
+          advanceAmount: advanceAmount,
         },
       ],
       { session },
     );
 
-    // Revenue entry ONLY for paid amount
-    if (paidAmount > 0) {
+    /* =========================
+       PAYMENT + REVENUE
+    ========================= */
+
+    if (totalPaid > 0) {
+      await Payment.create(
+        [
+          {
+            order: order[0]._id,
+            customer: customerId,
+            amount: totalPaid,
+            paymentMode: "mixed",
+          },
+        ],
+        { session },
+      );
+
       await Revenue.create(
         [
           {
             source: "order",
             order: order[0]._id,
-            amount: Number(paidAmount),
+            amount: totalPaid,
           },
         ],
         { session },
@@ -106,8 +172,9 @@ async function handleCreateOrder(req, res) {
     res.status(400).json({ msg: err.message });
   }
 }
-
-//using
+/* =========================
+   PAY ORDER (WITH WALLET ADD)
+========================= */
 async function handleOrderPay(req, res) {
   try {
     const { amount } = req.body;
@@ -115,17 +182,32 @@ async function handleOrderPay(req, res) {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ msg: "Order not found" });
 
-    order.paidAmount += amount;
-    order.balanceAmount = order.totalAmount - order.paidAmount;
+    const customer = await Customer.findById(order.customer);
 
-    if (order.balanceAmount <= 0) {
-      order.status = "paid";
-      order.balanceAmount = 0;
-    } else {
-      order.status = "partial";
+    order.paidAmount += amount;
+
+    let walletAdded = 0;
+
+    if (order.paidAmount > order.totalAmount) {
+      walletAdded = order.paidAmount - order.totalAmount;
+
+      customer.walletBalance += walletAdded;
+
+      order.walletAdded = (order.walletAdded || 0) + walletAdded;
+      order.paidAmount = order.totalAmount;
     }
 
+    order.balanceAmount = order.totalAmount - order.paidAmount;
+
+    order.status =
+      order.balanceAmount <= 0
+        ? "paid"
+        : order.paidAmount > 0
+          ? "partial"
+          : "pending";
+
     await order.save();
+    await customer.save();
 
     await Payment.create({
       order: order._id,
@@ -140,13 +222,10 @@ async function handleOrderPay(req, res) {
       amount,
     });
 
-    // 📲 WhatsApp hook
-    // sendWhatsApp(order.customerName, amount);
-
     res.json(order);
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ msg: err.message });
+    res.status(500).json({ msg: err.message });
   }
 }
 
@@ -619,8 +698,81 @@ async function handleCustomerBulkPay(req, res) {
   }
 }
 
+async function handleDeleteOrder(req, res) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { action } = req.body; // "1" | "2" | "3"
+
+    const order = await Order.findById(req.params.id).session(session);
+    if (!order) throw new Error("Order not found");
+
+    const customer = await Customer.findById(order.customer).session(session);
+
+    /* =========================
+       RESTORE STOCK
+    ========================= */
+    for (const item of order.items) {
+      const product = await Product.findById(item.product).session(session);
+
+      if (product && product.trackStock) {
+        product.stock += item.qty;
+        await product.save({ session });
+      }
+    }
+
+    /* =========================
+       WALLET LOGIC (FIXED)
+    ========================= */
+
+    // ❗ IMPORTANT:
+    // paidAmount already includes walletUsed
+    // so NEVER add walletUsed separately
+
+    if (action === "1") {
+      // ✅ ADD TO WALLET
+      customer.walletBalance += order.paidAmount;
+    } else if (action === "2") {
+      // ✅ REFUND (REMOVE FROM REVENUE)
+      // no wallet change
+      await Revenue.deleteMany({ order: order._id }).session(session);
+    } else if (action === "3") {
+      // ✅ DO NOTHING
+      // no wallet change
+    }
+
+    // remove advance always
+    if (order.walletAdded > 0) {
+      customer.walletBalance -= order.walletAdded;
+    }
+
+    if (customer.walletBalance < 0) {
+      customer.walletBalance = 0;
+    }
+
+    await customer.save({ session });
+
+    /* =========================
+       DELETE ORDER
+    ========================= */
+    await Order.findByIdAndDelete(order._id).session(session);
+
+    await session.commitTransaction();
+    session.endSession();
+
+    res.json({ msg: "Order deleted successfully" });
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+
+    res.status(400).json({ msg: err.message });
+  }
+}
+
 module.exports = {
   handleCreateOrder,
+  handleDeleteOrder,
   handleWalkinCustomer,
   handleEditOrder,
   handleOrderPay,
